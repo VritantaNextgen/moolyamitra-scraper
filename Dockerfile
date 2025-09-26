@@ -9,16 +9,17 @@ RUN apt-get update && apt-get install -y \
     wget \
     unzip \
     gnupg \
-    # Add Google’s signing key
-    && wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key add - \
-    # Add Google Chrome repository
-    && echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google-chrome.list \
+    ca-certificates \
+    # Add Google’s signing key securely
+    && wget -q -O /usr/share/keyrings/google-linux-signing-key.gpg https://dl.google.com/linux/linux_signing_key.pub \
+    # Add the Google Chrome repository
+    && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-linux-signing-key.gpg] http://dl.google.com/linux/chrome/deb/ stable main" \
+       > /etc/apt/sources.list.d/google-chrome.list \
     && apt-get update \
     # Install Chrome
     && apt-get install -y google-chrome-stable \
     # Cleanup to keep image small
     && rm -rf /var/lib/apt/lists/*
-
 # Copy the requirements file into the container.
 COPY requirements.txt .
 
