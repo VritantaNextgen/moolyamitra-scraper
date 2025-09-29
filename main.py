@@ -1,192 +1,155 @@
 import boto3
-import requests
-import gzip
-import xml.etree.ElementTree as ET
+import re
 from fastapi import FastAPI, HTTPException, Body, BackgroundTasks
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import NoSuchElementException, TimeoutException
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
 from pydantic import BaseModel
 import time
-import re
+
+# --- Configuration for Different E-commerce Sites ---
+# This is where you, as my teammate, will help by providing the XML paths (CSS selectors).
+# I have pre-filled the ones for Amazon and Flipkart based on my analysis.
+SITE_CONFIG = {
+    "amazon": {
+        "search_url": "https://www.amazon.in/s?k=",
+        "selectors": {
+            "search_result_link": "div[data-component-type='s-search-result'] h2 a",
+            "name": "#productTitle",
+            "price": "span.a-price-whole",
+            "image": "#landingImage, #imgBlkFront"
+        }
+    },
+    "flipkart": {
+        "search_url": "https://www.flipkart.com/search?q=",
+        "selectors": {
+            "search_result_link": "._1fQZEK, ._4ddWXP a",
+            "name": ".B_NuCI, ._35KyD6",
+            "price": "._30jeq3._16Jk6d, ._1_WHN1",
+            "image": "._396cs4._2amPTt._3qGmMb, ._2r_T1I"
+        }
+    }
+}
 
 # --- FastAPI App Initialization ---
 app = FastAPI(
-    title="MoolyaMitra Scraping API",
-    description="An API to discover product URLs from sitemaps and scrape their data into DynamoDB.",
-    version="2.1.0" # Version updated for robust sitemap fetching
+    title="MoolyaMitra Intelligent Scraping API",
+    description="A modular, multi-site API to scrape product data and save it to DynamoDB.",
+    version="3.0.0"
 )
 
-# --- Pydantic Models for Request Body ---
-class SitemapScrapeRequest(BaseModel):
-    site: str # e.g., "amazon"
+# --- Pydantic Models for API Request ---
+class ScrapeRequest(BaseModel):
+    product_query: str
+    category: str
+    productID: str
+    site: str
 
-# --- Selenium WebDriver Setup ---
-def get_driver():
-    chrome_options = Options()
-    chrome_options.add_argument("--headless")
-    chrome_options.add_argument("--no-sandbox")
-    chrome_options.add_argument("--disable-dev-shm-usage")
-    chrome_options.add_argument("--window-size=1920,1080")
-    chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
-    service = Service(ChromeDriverManager().install())
-    driver = webdriver.Chrome(service=service, options=chrome_options)
-    return driver
+# --- The Scraper Engine ---
+class Scraper:
+    def __init__(self, site: str):
+        if site not in SITE_CONFIG:
+            raise ValueError(f"Site '{site}' is not configured.")
+        self.config = SITE_CONFIG[site]
+        self.driver = self._get_driver()
+        self.wait = WebDriverWait(self.driver, 15)
 
-# --- Helper function to find elements with multiple fallback selectors ---
-def find_element_with_fallbacks(driver, wait, selectors):
-    for selector_type, selector_value in selectors:
+    def _get_driver(self):
+        chrome_options = Options()
+        chrome_options.add_argument("--headless")
+        chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument("--disable-dev-shm-usage")
+        chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
+        service = Service(ChromeDriverManager().install())
+        return webdriver.Chrome(service=service, options=chrome_options)
+
+    def scrape(self, query: str):
         try:
-            element = wait.until(EC.presence_of_element_located((selector_type, selector_value)))
-            print(f"  [Success] Found element with selector: {selector_value}")
-            return element
+            print(f"--- Starting scrape for '{query}' on {self.config['search_url']} ---")
+            product_url = self._find_product_url(query)
+            if not product_url:
+                print("Could not find a valid product URL in search results.")
+                return None
+            
+            return self._scrape_product_page(product_url)
+        finally:
+            self.driver.quit()
+
+    def _find_product_url(self, query: str):
+        search_url = f"{self.config['search_url']}{query.replace(' ', '+')}"
+        self.driver.get(search_url)
+        try:
+            link_element = self.wait.until(EC.presence_of_element_located(
+                (By.CSS_SELECTOR, self.config['selectors']['search_result_link'])
+            ))
+            url = link_element.get_attribute('href')
+            # Ensure the URL is absolute
+            if not url.startswith("http"):
+                base_url = "https://www.amazon.in" if "amazon" in self.config['search_url'] else "https://www.flipkart.com"
+                url = base_url + url
+            return url
         except TimeoutException:
-            print(f"  [Info] Could not find element with selector: {selector_value}. Trying next...")
-    print("  [Error] Exhausted all fallback selectors. Element not found.")
-    return None
+            return None
 
-# --- UPDATED: Functions to parse robots.txt and XML Sitemaps with User-Agent ---
-def get_sitemap_urls_from_robots(site_url: str):
-    """Fetches and parses robots.txt to find sitemap URLs."""
-    print(f"Fetching robots.txt from {site_url}/robots.txt")
+    def _scrape_product_page(self, url: str):
+        self.driver.get(url)
+        try:
+            name = self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, self.config['selectors']['name']))).text.strip()
+            price_raw = self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, self.config['selectors']['price']))).get_attribute("textContent")
+            image_url = self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, self.config['selectors']['image']))).get_attribute('src')
+            
+            # Clean the price
+            price_clean = re.sub(r'[₹,]', '', price_raw)
+            price = int(float(price_clean))
+
+            return {"name": name, "price": price, "image": image_url}
+        except (TimeoutException, ValueError, AttributeError) as e:
+            print(f"Failed to scrape details from {url}. Reason: {e}")
+            return None
+
+# --- Background Task & API Endpoint ---
+def scrape_and_save_task(request: ScrapeRequest):
+    """This function runs in the background to avoid timeouts."""
+    print(f"Background task started for productID: {request.productID}")
     try:
-        # ADDED User-Agent header to mimic a real browser
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
-        response = requests.get(f"{site_url}/robots.txt", headers=headers)
-        response.raise_for_status()
-        sitemap_urls = re.findall(r'Sitemap:\s*(.*)', response.text)
-        print(f"Found {len(sitemap_urls)} sitemap(s) in robots.txt")
-        return sitemap_urls
-    except requests.exceptions.RequestException as e:
-        print(f"ERROR: Could not fetch robots.txt: {e}")
-        return []
+        scraper = Scraper(request.site)
+        scraped_data = scraper.scrape(request.product_query)
 
-def get_product_urls_from_sitemap(sitemap_url: str):
-    """Downloads a sitemap (handling .gz) and extracts product URLs."""
-    print(f"Processing sitemap: {sitemap_url}")
-    try:
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        response = requests.get(sitemap_url, headers=headers)
-        response.raise_for_status()
+        if not scraped_data:
+            print(f"Scraping failed for '{request.product_query}'.")
+            return
 
-        content = gzip.decompress(response.content) if sitemap_url.endswith('.gz') else response.content
-        root = ET.fromstring(content)
-        
-        namespace = {'s': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
-        urls = [url.text for url in root.findall('s:url/s:loc', namespace)]
-        print(f"Extracted {len(urls)} URLs from {sitemap_url}")
-        return urls
-    except Exception as e:
-        print(f"ERROR: Failed to process sitemap {sitemap_url}: {e}")
-        return []
+        item_to_save = {
+            "category": request.category,
+            "productID": request.productID,
+            "name": scraped_data["name"],
+            "description": f"Data for '{scraped_data['name']}'.",
+            "image": scraped_data["image"],
+            "prices": {
+                request.site.title(): scraped_data["price"]
+            },
+            "tags": [request.category, request.site.title()]
+        }
 
-# --- Scrapes a specific product page URL (no changes needed here) ---
-def scrape_amazon_product_page(driver, product_url: str):
-    driver.get(product_url)
-    wait = WebDriverWait(driver, 15)
-    
-    if "api-services.ge" in driver.current_url or "captcha" in driver.page_source.lower():
-        print("[CRITICAL ERROR] Amazon is showing a CAPTCHA. Scraping cannot proceed for this URL.")
-        return None
-
-    try:
-        print(f"Navigated to product page: {product_url}")
-        name_selectors = [(By.ID, "productTitle"), (By.CSS_SELECTOR, "h1.a-size-large.a-spacing-none")]
-        name_element = find_element_with_fallbacks(driver, wait, name_selectors)
-        if not name_element: return None
-        name = name_element.text.strip()
-
-        price_selectors = [(By.CSS_SELECTOR, "span.a-price-whole"), (By.CSS_SELECTOR, ".priceToPay span.a-offscreen")]
-        price_element = find_element_with_fallbacks(driver, wait, price_selectors)
-        if not price_element: return None
-        price_str = price_element.get_attribute("textContent").replace('₹', '').replace(',', '').strip()
-        price = int(float(price_str))
-        
-        image_selectors = [(By.ID, "landingImage"), (By.ID, "imgBlkFront"), (By.CSS_SELECTOR, ".imgTagWrapper img")]
-        image_element = find_element_with_fallbacks(driver, wait, image_selectors)
-        if not image_element: return None
-        image_url = image_element.get_attribute('src')
-        
-        asin_match = re.search(r'/(dp|gp/product)/([A-Z0-9]{10})', product_url)
-        product_id = asin_match.group(2) if asin_match else "UNKNOWN"
-        category = "Electronics" 
-
-        return {"name": name, "price": price, "image": image_url, "productID": product_id, "category": category}
+        dynamodb = boto3.resource('dynamodb', region_name='ap-south-1')
+        table = dynamodb.Table('MoolyaMitra-Products')
+        table.put_item(Item=item_to_save)
+        print(f"Successfully saved item {request.productID} to DynamoDB.")
 
     except Exception as e:
-        print(f"A critical error occurred while scraping {product_url}: {e}")
-        return None
+        print(f"A critical error occurred in the background task: {e}")
 
-# --- Background task for the entire scraping job (Updated to be smarter) ---
-def sitemap_scraping_task(site: str):
-    print(f"\n--- Starting background sitemap scrape for {site} ---")
-    site_map = {"amazon": "https://www.amazon.in"}
-    base_url = site_map.get(site.lower())
-    
-    if not base_url:
-        print(f"Site '{site}' not supported.")
-        return
-
-    all_sitemaps = get_sitemap_urls_from_robots(base_url)
-    if not all_sitemaps:
-        print("No sitemaps found. Exiting.")
-        return
-        
-    # --- NEW: Intelligently select a product sitemap ---
-    product_sitemap = None
-    for sitemap in all_sitemaps:
-        if 'sitemap_dp' in sitemap: # 'dp' usually means "detail page"
-            product_sitemap = sitemap
-            break
-            
-    if not product_sitemap:
-        print("Could not find a specific product sitemap. Using the first one found.")
-        product_sitemap = all_sitemaps[0]
-
-    driver = get_driver()
-    dynamodb = boto3.resource('dynamodb', region_name='ap-south-1')
-    table = dynamodb.Table('MoolyaMitra-Products')
-    
-    try:
-        product_urls = get_product_urls_from_sitemap(product_sitemap)
-        
-        for url in product_urls[:5]: # Scrape first 5 products for testing
-            print(f"\n--- Scraping URL: {url} ---")
-            scraped_data = scrape_amazon_product_page(driver, url)
-            
-            if scraped_data:
-                item_to_save = {
-                    "category": scraped_data["category"],
-                    "productID": scraped_data["productID"],
-                    "name": scraped_data["name"],
-                    "description": f"Scraped data for product {scraped_data['productID']}.",
-                    "image": scraped_data["image"],
-                    "prices": {"Amazon": scraped_data["price"]},
-                    "tags": [scraped_data["category"], "Scraped", "Sitemap"]
-                }
-                try:
-                    table.put_item(Item=item_to_save)
-                    print(f"  [SUCCESS] Saved item {item_to_save['productID']} to DynamoDB.")
-                except Exception as e:
-                    print(f"  [ERROR] Failed to save item {item_to_save['productID']} to DynamoDB: {e}")
-            
-            time.sleep(2)
-
-    finally:
-        driver.quit()
-        print("\n--- Background sitemap scrape finished ---")
-
-# --- API Endpoint to trigger the background task ---
-@app.post("/start-sitemap-scrape")
-def start_sitemap_scrape(request: SitemapScrapeRequest, background_tasks: BackgroundTasks):
-    background_tasks.add_task(sitemap_scraping_task, request.site)
+@app.post("/start-scrape-job")
+def start_scrape_job(request: ScrapeRequest, background_tasks: BackgroundTasks):
+    """Accepts a scrape request and starts it as a background job."""
+    background_tasks.add_task(scrape_and_save_task, request)
     return {
-        "status": "success",
-        "message": f"Accepted. A background scraping job has been started for '{request.site}'. This may take a long time."
+        "status": "accepted",
+        "message": f"Scraping job for '{request.product_query}' on {request.site} has been started in the background."
     }
 
