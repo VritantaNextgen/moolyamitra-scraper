@@ -4,17 +4,18 @@ from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
-from selenium.common.exceptions import NoSuchElementException
+from selenium.common.exceptions import NoSuchElementException, TimeoutException
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
 from pydantic import BaseModel
+import time
 
 # --- FastAPI App Initialization ---
 app = FastAPI(
     title="MoolyaMitra Scraping API",
     description="An API to scrape product data from e-commerce sites and save it to DynamoDB.",
-    version="1.1.0" # Version updated
+    version="1.2.0" # Version updated for robustness
 )
 
 # --- Pydantic Models for Request Body ---
@@ -31,39 +32,66 @@ def get_driver():
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--window-size=1920,1080")
-    # Add a user-agent to appear more like a real browser
     chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
     service = Service(ChromeDriverManager().install())
     driver = webdriver.Chrome(service=service, options=chrome_options)
     return driver
 
-# --- UPDATED Scraping Logic with more robust selectors ---
+# --- NEW: More Robust Scraping Logic with Fallbacks & Better Logging ---
 def scrape_amazon_product(driver, query: str):
     driver.get(f"https://www.amazon.in/s?k={query.replace(' ', '+')}")
-    wait = WebDriverWait(driver, 10)
+    wait = WebDriverWait(driver, 15) # Increased wait time
     
     try:
-        # Wait for search results to be present and find the first product link
+        # --- Find and click the first product link ---
+        print("Searching for product link...")
         first_product_link = wait.until(EC.presence_of_element_located(
             (By.CSS_SELECTOR, "div[data-component-type='s-search-result'] h2 a")
         ))
         product_url = first_product_link.get_attribute('href')
         driver.get(product_url)
+        print(f"Navigated to product page: {product_url}")
 
-        # Scrape details from the product page using updated selectors
-        name = wait.until(EC.presence_of_element_located((By.ID, "productTitle"))).text.strip()
-        
-        # This is a more robust way to find the price
-        price_str = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "span.a-price-whole"))).text.replace(',', '').strip()
-        price = int(price_str)
-        
-        # This is a more robust way to find the main image
-        image_url = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "#landingImage, #imgBlkFront"))).get_attribute('src')
+        # --- Scrape Name ---
+        name = ""
+        try:
+            print("Finding product name...")
+            name = wait.until(EC.presence_of_element_located((By.ID, "productTitle"))).text.strip()
+            print(f"Found name: {name}")
+        except TimeoutException:
+            print("ERROR: Could not find product name by ID 'productTitle'.")
+            return None
+
+        # --- Scrape Price (with fallbacks) ---
+        price = 0
+        try:
+            print("Finding product price...")
+            price_str = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "span.a-price-whole"))).text.replace(',', '').strip()
+            price = int(price_str)
+            print(f"Found price: {price}")
+        except TimeoutException:
+            print("ERROR: Could not find price with 'span.a-price-whole'.")
+            # Fallback for different price structures if needed
+            return None # Fail for now if price is not found
+
+        # --- Scrape Image (with fallbacks) ---
+        image_url = ""
+        try:
+            print("Finding product image...")
+            # This selector checks for two common image element IDs
+            image_element = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "#landingImage, #imgBlkFront")))
+            image_url = image_element.get_attribute('src')
+            print(f"Found image URL: {image_url}")
+        except TimeoutException:
+            print("ERROR: Could not find image with selectors '#landingImage, #imgBlkFront'.")
+            return None # Fail for now if image is not found
         
         return {"name": name, "price": price, "image": image_url}
 
     except Exception as e:
-        print(f"An error occurred during scraping: {e}")
+        print(f"A critical error occurred during the scraping process: {e}")
+        # Save a screenshot for debugging if something goes wrong
+        driver.save_screenshot("debug_screenshot.png")
         return None
 
 # --- API Endpoint (No changes needed here) ---
