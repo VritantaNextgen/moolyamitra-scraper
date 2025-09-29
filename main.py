@@ -1,108 +1,110 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
-from typing import List, Dict
-import boto3 # AWS SDK for Python
-import time
-import os
-
-# Selenium imports for web automation
+import boto3
+from fastapi import FastAPI, HTTPException, Body
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
 from selenium.common.exceptions import NoSuchElementException
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
+from pydantic import BaseModel
 
-# --- 1. Define Data Models ---
-class ScrapeRequest(BaseModel):
-    product_query: str = Field(..., description="The search term for the product, e.g., 'Prestige Iris Mixer Grinder'")
-    category: str = Field(..., description="The category for the product, e.g., 'Home & Kitchen'")
-    productID: str = Field(..., description="A unique ID for the product, e.g., 'HK005'")
-
-# --- 2. Initialize FastAPI & DynamoDB ---
+# --- FastAPI App Initialization ---
 app = FastAPI(
     title="MoolyaMitra Scraping API",
-    description="An API to scrape product data and save it to DynamoDB.",
-    version="1.1.0"
+    description="An API to scrape product data from e-commerce sites and save it to DynamoDB.",
+    version="1.1.0" # Version updated
 )
 
-# Initialize DynamoDB client. It will automatically use the permissions
-# from the AWS environment it's running in (App Runner).
-# Make sure your App Runner instance has an IAM role with DynamoDB write permissions.
-dynamodb = boto3.resource('dynamodb', region_name='ap-south-1') # Ensure this is your AWS region
-table = dynamodb.Table('MoolyaMitra-Products') 
+# --- Pydantic Models for Request Body ---
+class ScrapeRequest(BaseModel):
+    product_query: str
+    category: str
+    productID: str
+    site: str
 
-# --- 3. Scraping Function ---
-def scrape_amazon_product(product_name: str) -> dict:
+# --- Selenium WebDriver Setup ---
+def get_driver():
     chrome_options = Options()
     chrome_options.add_argument("--headless")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--window-size=1920,1080")
+    # Add a user-agent to appear more like a real browser
     chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
-
     service = Service(ChromeDriverManager().install())
     driver = webdriver.Chrome(service=service, options=chrome_options)
+    return driver
+
+# --- UPDATED Scraping Logic with more robust selectors ---
+def scrape_amazon_product(driver, query: str):
+    driver.get(f"https://www.amazon.in/s?k={query.replace(' ', '+')}")
+    wait = WebDriverWait(driver, 10)
     
-    scraped_data = { "name": "Not Found", "price": 0.0, "image_url": "N/A" }
-
     try:
-        driver.get("https://www.amazon.in")
-        time.sleep(2)
-        search_box = driver.find_element(By.ID, "twotabsearchtextbox")
-        search_box.send_keys(product_name)
-        search_box.submit()
-        time.sleep(3)
+        # Wait for search results to be present and find the first product link
+        first_product_link = wait.until(EC.presence_of_element_located(
+            (By.CSS_SELECTOR, "div[data-component-type='s-search-result'] h2 a")
+        ))
+        product_url = first_product_link.get_attribute('href')
+        driver.get(product_url)
 
-        # Find the first product result
-        first_result = driver.find_element(By.CSS_SELECTOR, "div[data-component-type='s-search-result']")
+        # Scrape details from the product page using updated selectors
+        name = wait.until(EC.presence_of_element_located((By.ID, "productTitle"))).text.strip()
         
-        try:
-            product_title_element = first_result.find_element(By.CSS_SELECTOR, "span.a-size-medium.a-color-base.a-text-normal")
-            scraped_data["name"] = product_title_element.text
-        except NoSuchElementException: pass
-
-        try:
-            price_element = first_result.find_element(By.CSS_SELECTOR, ".a-price-whole")
-            scraped_data["price"] = float(price_element.text.replace(",", ""))
-        except NoSuchElementException: pass
-            
-        try:
-            image_element = first_result.find_element(By.CSS_SELECTOR, "img.s-image")
-            scraped_data["image_url"] = image_element.get_attribute('src')
-        except NoSuchElementException: pass
+        # This is a more robust way to find the price
+        price_str = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "span.a-price-whole"))).text.replace(',', '').strip()
+        price = int(price_str)
+        
+        # This is a more robust way to find the main image
+        image_url = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "#landingImage, #imgBlkFront"))).get_attribute('src')
+        
+        return {"name": name, "price": price, "image": image_url}
 
     except Exception as e:
         print(f"An error occurred during scraping: {e}")
+        return None
+
+# --- API Endpoint (No changes needed here) ---
+@app.post("/scrape-and-save")
+def scrape_and_save(request: ScrapeRequest):
+    driver = get_driver()
+    scraped_data = None
+    try:
+        if request.site.lower() == "amazon":
+            scraped_data = scrape_amazon_product(driver, request.product_query)
+        else:
+             raise HTTPException(status_code=400, detail=f"Scraping for site '{request.site}' is not supported.")
+
+        if not scraped_data:
+            raise HTTPException(status_code=404, detail=f"Could not find product details for '{request.product_query}' on Amazon.")
+
+        item_to_save = {
+            "category": request.category,
+            "productID": request.productID,
+            "name": scraped_data["name"],
+            "description": f"Scraped data for '{request.product_query}'.",
+            "image": scraped_data["image"],
+            "prices": {
+                "Amazon": scraped_data["price"]
+            },
+            "tags": [request.category, "Scraped", "Trending"]
+        }
+
+        try:
+            dynamodb = boto3.resource('dynamodb', region_name='ap-south-1')
+            table = dynamodb.Table('MoolyaMitra-Products')
+            table.put_item(Item=item_to_save)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to save data to DynamoDB: {str(e)}")
+
+        return {
+            "status": "success",
+            "message": f"Successfully scraped and saved '{scraped_data['name']}'",
+            "data": item_to_save
+        }
+
     finally:
         driver.quit()
-        
-    return scraped_data
-
-# --- 4. API Endpoint ---
-@app.post("/scrape-and-save")
-async def scrape_and_save_product(request: ScrapeRequest):
-    print(f"Starting scrape for: {request.product_query}...")
-    scraped_info = scrape_amazon_product(request.product_query)
-    print(f"Scraping finished. Data: {scraped_info}")
-    
-    if scraped_info["name"] == "Not Found":
-        raise HTTPException(status_code=404, detail=f"Could not find product details for '{request.product_query}' on Amazon.")
-
-    item_to_save = {
-        'category': request.category,
-        'productID': request.productID,
-        'name': scraped_info['name'],
-        'description': f"Scraped data for '{request.product_query}'.",
-        'image': scraped_info['image_url'],
-        'prices': {'Amazon': scraped_info['price']},
-        'tags': [request.category, "Scraped", "Trending"]
-    }
-
-    try:
-        table.put_item(Item=item_to_save)
-        print(f"Successfully saved item {request.productID} to DynamoDB.")
-        return {"status": "success", "message": f"Successfully scraped and saved '{scraped_info['name']}'", "data": item_to_save}
-    except Exception as e:
-        print(f"Error saving to DynamoDB: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to save item to database. Check App Runner logs and IAM permissions. Error: {str(e)}")
 
