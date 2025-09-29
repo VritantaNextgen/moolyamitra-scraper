@@ -15,7 +15,7 @@ import time
 app = FastAPI(
     title="MoolyaMitra Scraping API",
     description="An API to scrape product data from e-commerce sites and save it to DynamoDB.",
-    version="1.2.0" # Version updated for robustness
+    version="1.3.0" # Version updated for advanced scraping
 )
 
 # --- Pydantic Models for Request Body ---
@@ -37,64 +37,81 @@ def get_driver():
     driver = webdriver.Chrome(service=service, options=chrome_options)
     return driver
 
-# --- NEW: More Robust Scraping Logic with Fallbacks & Better Logging ---
+# --- NEW: Helper function to find elements with multiple fallback selectors ---
+def find_element_with_fallbacks(driver, wait, selectors):
+    """Tries a list of selectors in order and returns the first element found."""
+    for selector_type, selector_value in selectors:
+        try:
+            element = wait.until(EC.presence_of_element_located((selector_type, selector_value)))
+            print(f"  [Success] Found element with selector: {selector_value}")
+            return element
+        except TimeoutException:
+            print(f"  [Info] Could not find element with selector: {selector_value}. Trying next...")
+    print("  [Error] Exhausted all fallback selectors. Element not found.")
+    return None
+
+# --- NEW: Heavily revised scraping logic with fallbacks and better logging ---
 def scrape_amazon_product(driver, query: str):
     driver.get(f"https://www.amazon.in/s?k={query.replace(' ', '+')}")
-    wait = WebDriverWait(driver, 15) # Increased wait time
+    wait = WebDriverWait(driver, 15)
     
+    # --- CAPTCHA Check ---
+    if "api-services.ge" in driver.current_url or "captcha" in driver.page_source.lower():
+        print("[CRITICAL ERROR] Amazon is showing a CAPTCHA. Scraping cannot proceed.")
+        return None
+
     try:
         # --- Find and click the first product link ---
         print("Searching for product link...")
-        first_product_link = wait.until(EC.presence_of_element_located(
-            (By.CSS_SELECTOR, "div[data-component-type='s-search-result'] h2 a")
-        ))
+        search_result_selectors = [
+            (By.CSS_SELECTOR, "div[data-component-type='s-search-result'] h2 a"),
+            (By.CSS_SELECTOR, ".s-result-item .a-link-normal.a-text-normal") # Fallback selector
+        ]
+        first_product_link = find_element_with_fallbacks(driver, wait, search_result_selectors)
+        
+        if not first_product_link:
+            print("ERROR: Could not find the first product link in search results.")
+            return None
+            
         product_url = first_product_link.get_attribute('href')
+        if not product_url.startswith("http"):
+            product_url = "https://www.amazon.in" + product_url
         driver.get(product_url)
         print(f"Navigated to product page: {product_url}")
 
         # --- Scrape Name ---
-        name = ""
-        try:
-            print("Finding product name...")
-            name = wait.until(EC.presence_of_element_located((By.ID, "productTitle"))).text.strip()
-            print(f"Found name: {name}")
-        except TimeoutException:
-            print("ERROR: Could not find product name by ID 'productTitle'.")
-            return None
+        print("\nFinding product name...")
+        name_selectors = [(By.ID, "productTitle"), (By.CSS_SELECTOR, "h1.a-size-large.a-spacing-none")]
+        name_element = find_element_with_fallbacks(driver, wait, name_selectors)
+        if not name_element: return None
+        name = name_element.text.strip()
+        print(f"Found name: {name}")
 
-        # --- Scrape Price (with fallbacks) ---
-        price = 0
-        try:
-            print("Finding product price...")
-            price_str = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "span.a-price-whole"))).text.replace(',', '').strip()
-            price = int(price_str)
-            print(f"Found price: {price}")
-        except TimeoutException:
-            print("ERROR: Could not find price with 'span.a-price-whole'.")
-            # Fallback for different price structures if needed
-            return None # Fail for now if price is not found
-
-        # --- Scrape Image (with fallbacks) ---
-        image_url = ""
-        try:
-            print("Finding product image...")
-            # This selector checks for two common image element IDs
-            image_element = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "#landingImage, #imgBlkFront")))
-            image_url = image_element.get_attribute('src')
-            print(f"Found image URL: {image_url}")
-        except TimeoutException:
-            print("ERROR: Could not find image with selectors '#landingImage, #imgBlkFront'.")
-            return None # Fail for now if image is not found
+        # --- Scrape Price ---
+        print("\nFinding product price...")
+        price_selectors = [(By.CSS_SELECTOR, "span.a-price-whole"), (By.CSS_SELECTOR, ".priceToPay span.a-offscreen")]
+        price_element = find_element_with_fallbacks(driver, wait, price_selectors)
+        if not price_element: return None
+        price_str = price_element.get_attribute("textContent").replace('₹', '').replace(',', '').strip()
+        price = int(float(price_str))
+        print(f"Found price: {price}")
+        
+        # --- Scrape Image ---
+        print("\nFinding product image...")
+        image_selectors = [(By.ID, "landingImage"), (By.ID, "imgBlkFront"), (By.CSS_SELECTOR, ".imgTagWrapper img")]
+        image_element = find_element_with_fallbacks(driver, wait, image_selectors)
+        if not image_element: return None
+        image_url = image_element.get_attribute('src')
+        print(f"Found image URL: {image_url}")
         
         return {"name": name, "price": price, "image": image_url}
 
     except Exception as e:
         print(f"A critical error occurred during the scraping process: {e}")
-        # Save a screenshot for debugging if something goes wrong
         driver.save_screenshot("debug_screenshot.png")
         return None
 
-# --- API Endpoint (No changes needed here) ---
+# --- API Endpoint ---
 @app.post("/scrape-and-save")
 def scrape_and_save(request: ScrapeRequest):
     driver = get_driver()
